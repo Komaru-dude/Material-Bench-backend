@@ -1,136 +1,106 @@
 #!/bin/bash
+
 set -e
 
-GIT_REPO_URL="${GIT_REPO_URL:-https://github.com/Komaru-dude/Material-Bench-backend.git}"
-APP_DIR="${APP_DIR:-/opt/material_bench_api}"
-APP_NAME="${APP_NAME:-material_bench_api}"
-DB_USER="${DB_USER:-bench_user}"
-DB_NAME="${DB_NAME:-material_bench}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-VENV_PYTHON="$APP_DIR/venv/bin/python3"
-DB_PASS="${DB_PASS:-$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)}"
-FALLBACK_REQUIREMENTS=("fastapi" "uvicorn" "asyncpg" "gunicorn")
+APP_DIR="material-bench-backend"
+SERVICE_NAME="material-bench-backend"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+GIT_REPO="https://github.com/Komaru-dude/Material-Bench-backend"
+USER_TO_RUN=$(whoami)
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Этот скрипт должен быть запущен от имени root (sudo)."
-  exit 1
-fi
+echo "Установка будет выполнена для пользователя: ${USER_TO_RUN}"
 
-echo "=== Установка зависимостей системы ==="
 apt update -qq
-DEBIAN_FRONTEND=noninteractive apt install -y python3-venv python3-pip postgresql postgresql-client build-essential git openssl
+apt install -y python3 python3-venv git openssl
+apt upgrade -y python3 python3-venv
 
-echo "=== Настройка приложения ==="
-mkdir -p "$APP_DIR"
-chown root:root "$APP_DIR"
-chmod 755 "$APP_DIR"
+echo "Клонирую репозиторий ${GIT_REPO}..."
+if [ -d "$APP_DIR" ]; then
+    echo "Директория ${APP_DIR} уже существует. Удаляю старую и клонирую заново..."
+    rm -rf "$APP_DIR"
+fi
 
-if [ ! -d "$APP_DIR/.git" ]; then
-  if [ -z "$(ls -A "$APP_DIR")" ]; then
-    echo "Клонирование $GIT_REPO_URL в $APP_DIR ..."
-    git clone --depth 1 "$GIT_REPO_URL" "$APP_DIR"
-  else
-    echo "$APP_DIR не пуста, но не является git репозиторием — клонирование во временную директорию и копирование."
-    TMPDIR=$(mktemp -d)
-    git clone --depth 1 "$GIT_REPO_URL" "$TMPDIR/repo"
-    cp -a "$TMPDIR/repo/." "$APP_DIR/"
-    rm -rf "$TMPDIR"
-    chown -R root:root "$APP_DIR"
-  fi
+git clone "${GIT_REPO}"
+echo "Клонирование завершено."
+cd "${APP_DIR}"
+
+echo "Создаю виртуальное окружение в директории 'venv'..."
+python3 -m venv venv
+echo "Виртуальное окружение создано."
+
+echo "Активирую окружение и устанавливаю зависимости..."
+source venv/bin/activate
+
+if [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt
 else
-  echo "Репозиторий найден в $APP_DIR — обновление."
-  git -C "$APP_DIR" fetch --all --prune
-  git -C "$APP_DIR" reset --hard origin/HEAD
-  git -C "$APP_DIR" pull --ff-only
+    pip install "fastapi[all]" uvicorn asyncpg python-dotenv
 fi
+echo "Все зависимости успешно установлены."
 
-echo "=== Настройка виртуального окружения Python ==="
-if [ ! -d "$APP_DIR/venv" ]; then
-  "$PYTHON_BIN" -m venv "$APP_DIR/venv"
-fi
+DB_PASS=$(openssl rand -base64 12)
 
-if [ ! -f "$VENV_PYTHON" ]; then
-  echo "Ошибка: Python в виртуальном окружении не найден!"
-  exit 1
-fi
-
-echo "Установка/обновление pip и setuptools..."
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools
-
-echo "=== Установка зависимостей Python ==="
-if [ -f "$APP_DIR/requirements.txt" ]; then
-  echo "Установка requirements из $APP_DIR/requirements.txt"
-  "$VENV_PYTHON" -m pip install -r "$APP_DIR/requirements.txt"
-else
-  echo "requirements.txt не найден — установка базовых пакетов"
-  for pkg in "${FALLBACK_REQUIREMENTS[@]}"; do
-    "$VENV_PYTHON" -m pip install "$pkg"
-  done
-fi
-
-echo "=== Настройка PostgreSQL ==="
-systemctl start postgresql || true
-systemctl enable postgresql || true
-
-echo "Настройка пользователя и базы данных..."
-if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
-  echo "Пользователь $DB_USER уже существует — обновление пароля"
-  sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH ENCRYPTED PASSWORD '$DB_PASS';"
-else
-  echo "Создание пользователя $DB_USER"
-  sudo -u postgres psql -c "CREATE USER \"$DB_USER\" WITH ENCRYPTED PASSWORD '$DB_PASS';"
-fi
-
-if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
-  echo "База данных $DB_NAME уже существует."
-else
-  echo "Создание базы данных $DB_NAME"
-  sudo -u postgres createdb -O "$DB_USER" "$DB_NAME"
-fi
-
-echo "=== Создание .env файла ==="
-cat > "$APP_DIR/.env" <<EOF
-DB_USER=$DB_USER
-DB_PASS=$DB_PASS
-DB_NAME=$DB_NAME
+echo "Создаю пример файла .env.example..."
+cat <<EOF > .env.example
+DB_USER=app_user
+DB_PASS=${DB_PASS}
+DB_NAME=mb_db
 DB_HOST=localhost
 EOF
-chmod 600 "$APP_DIR/.env"
+echo "Файл .env.example создан."
 
-echo "=== Настройка systemd службы ==="
-SERVICE_PATH="/etc/systemd/system/$APP_NAME.service"
-cat > "$SERVICE_PATH" <<EOF
+echo "Создаю вспомогательный скрипт запуска 'start_server.sh'..."
+
+FULL_APP_PATH=$(pwd)
+FULL_VENV_PATH="${FULL_APP_PATH}/venv/bin"
+
+cat <<EOF > "start_server.sh"
+#!/bin/bash
+git fetch
+git reset --hard origin/main
+source venv/bin/activate
+exec "${FULL_VENV_PATH}/uvicorn" app.__main__:app --host 0.0.0.0 --port 8000 --workers 2
+EOF
+chmod +x "start_server.sh"
+echo "Скрипт 'start_server.sh' создан."
+
+echo "Создаю systemd Unit-файл ${SERVICE_FILE}..."
+
+cat <<EOF > "${SERVICE_FILE}"
 [Unit]
-Description=$APP_NAME FastAPI Service
+Description=${SERVICE_NAME} FastAPI Application
 After=network.target postgresql.service
-Wants=postgresql.service
 
 [Service]
-User=www-data
-Group=www-data
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=$APP_DIR/venv/bin/gunicorn __main__:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
-Restart=on-failure
+User=${USER_TO_RUN}
+Group=${USER_TO_RUN}
+WorkingDirectory=${FULL_APP_PATH}
+ExecStart=/bin/bash ${FULL_APP_PATH}/start_server.sh
+Restart=always
 RestartSec=5
-TimeoutStartSec=30
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable "$APP_NAME.service"
-systemctl restart "$APP_NAME.service"
+echo "Systemd Unit-файл создан и помещен в ${SERVICE_FILE}."
 
-echo "=== Проверка статуса службы ==="
-sleep 3
-systemctl --no-pager status "$APP_NAME.service" -l
+echo ""
+echo "-------------------------------------------"
+echo "✅ Установка завершена!"
+echo "-------------------------------------------"
+echo ""
 
-echo "=== Последние логи службы ==="
-journalctl -u "$APP_NAME.service" -n 20 --no-pager || true
-
-echo "=== Установка завершена! ==="
-echo "Приложение установлено в: $APP_DIR"
-echo "Служба: $APP_NAME.service"
-echo "База данных: $DB_NAME, пользователь: $DB_USER"
+echo "Следующие шаги для завершения развертывания:"
+echo "1. Скопируйте '.env.example' в файл с именем '.env' в директории **${APP_DIR}**:"
+echo "   **cp ${APP_DIR}/.env.example ${APP_DIR}/.env**"
+echo ""
+echo "2. Отредактируйте файл **${APP_DIR}/.env** и укажите реальные данные для подключения к БД."
+echo ""
+echo "3. Для активации и запуска systemd-сервиса выполните (требуются права root/sudo):"
+echo "   **sudo systemctl daemon-reload**"
+echo "   **sudo systemctl enable ${SERVICE_NAME}.service**"
+echo "   **sudo systemctl start ${SERVICE_NAME}.service**"
+echo ""
+echo "4. Проверьте статус сервиса:"
+echo "   **sudo systemctl status ${SERVICE_NAME}.service**"
