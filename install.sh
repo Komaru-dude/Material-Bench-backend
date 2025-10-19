@@ -10,9 +10,8 @@ USER_TO_RUN=$(whoami)
 
 echo "Установка будет выполнена для пользователя: ${USER_TO_RUN}"
 
-apt update -qq
+apt update -y
 apt install -y python3 python3-venv git openssl
-apt upgrade -y python3 python3-venv
 
 echo "Клонирую репозиторий ${GIT_REPO}..."
 if [ -d "$APP_DIR" ]; then
